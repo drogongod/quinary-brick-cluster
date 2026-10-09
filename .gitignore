@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.npz
+*.dll
+*.obj
+*.exp
+*.lib
+voice_corpus.txt
+_test_*
+_sweep_*
