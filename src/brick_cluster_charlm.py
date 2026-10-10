@@ -449,10 +449,39 @@ class BrickCluster:
         return idx
 
     def route(self, features, for_training):
-        """Returns a brick index. TRAINING may spawn a new brick if nothing existing fits
-        (Phi_pos_i - Phi_neg > 0 for no i); INFERENCE never spawns -- always returns the
-        best-available brick (spawning on a read-only call would mean generating from an
-        untrained net, which is never useful), matching LSL's own training/inference asymmetry."""
+        """Returns a brick index. TRAINING may spawn a new brick if nothing existing fits;
+        INFERENCE never spawns -- always returns the best-available brick (spawning on a
+        read-only call would mean generating from an untrained net, which is never useful),
+        matching LSL's own training/inference asymmetry.
+
+        🔁⛔ 2026-10-09, PERSISTENT CHURN at 2M+ char scale -- DIAGNOSED (confirmed, not guessed)
+        but the obvious fix was TRIED AND REVERTED, a real negative result worth keeping.
+        Diagnosed directly via _diag_churn_mechanism.py: at larger corpora, ~280 bricks were
+        spawning fresh EVERY SINGLE PASS, immediately merged back down by that same pass's
+        consolidate() call, forever (confirmed: 272/280 of the exact same lines spawned in 4/4
+        watched passes, 97-100% overlap pass-over-pass -- a deterministic cycle, not noise). Root
+        cause: routing required `margin > 0` (strict) while consolidate() immediately tested the
+        SAME underlying margin at `margin > -MERGE_SLACK` (looser). Any line whose best existing-
+        brick margin fell in (-MERGE_SLACK, 0] failed routing (spawned fresh) then passed merging
+        in the very same pass (got swallowed) -- every pass, forever.
+        TRIED: changing this threshold to `margin <= -MERGE_SLACK` (reusing consolidate()'s own
+        tolerance, pre-empting a merge that would happen moments later anyway). CONFIRMED to
+        eliminate the 2M-scale churn completely (0 merges across 4 passes, down from ~280/pass,
+        re-verified via the same diagnostic). BUT regression-tested against the already-shipped,
+        verified-healthy 500K scale and found a REAL regression: brick count collapsed 71->4.
+        The two decisions are NOT equivalent at smaller scale the way the 2M diagnosis suggested --
+        route() picks the single best-by-margin brick over ALL existing bricks, while
+        consolidate() only considers the K=10 NEAREST-BY-DISTANCE candidates and processes merges
+        in a specific size-ordered, cascading sequence within a round; loosening ROUTING's
+        threshold globally let many more lines merge into existing bricks during growth itself
+        (not just the narrow churn-causing band), collapsing diversity broadly, not narrowly.
+        REVERTED to the original strict `margin > 0`. The 2M+ churn remains open and unfixed --
+        confirmed non-dangerous (stable brick count/quality, see brick_cluster_production_port.md
+        memory), just wasteful. A real fix would need something more targeted than reusing
+        MERGE_SLACK wholesale -- e.g. a per-line "already resolved this pass" memory, or aligning
+        consolidate()'s candidate selection with route()'s argmax-over-all-bricks instead of
+        K-nearest-by-distance -- deferred, not attempted again without a plan for why THAT
+        wouldn't also need a fresh regression check at every scale, per this exact negative result."""
         if not self.bricks:
             return self._spawn() if for_training else None
         gvar = self._global_var()
