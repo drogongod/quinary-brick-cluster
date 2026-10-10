@@ -83,11 +83,27 @@ def det_hash(s):
     return h
 
 
-def raw_trigram_counts(line, dim=FEATURE_DIM):
-    v = np.zeros(dim)
+def raw_trigram_sparse(line, dim=FEATURE_DIM):
+    """dict {bucket: count} -- O(line_length) time, O(distinct_buckets) space, NEVER allocates a
+    dense dim-sized array. 2026-10-09, added alongside FEATURE_DIM 64->8192 (see that constant's
+    comment): raising dim fixed real hash-collision false-merges but made every DENSE per-line
+    operation 128x more expensive; real lines are sparse (a few hundred to ~1200 active buckets
+    out of 8192, see _diag_hub_lines.py measurements), so routing/updates should cost O(nnz), not
+    O(dim). This is the hashing primitive the sparse hot path (tfidf_sparse, _OnlineGaussian's
+    sparse update/log_density) is built on; raw_trigram_counts below is kept dense for backward
+    compatibility with existing diagnostics that expect a dense array."""
+    counts = {}
     s = line.lower()
     for i in range(len(s) - 2):
-        v[det_hash(s[i:i + 3]) % dim] += 1
+        b = det_hash(s[i:i + 3]) % dim
+        counts[b] = counts.get(b, 0) + 1
+    return counts
+
+
+def raw_trigram_counts(line, dim=FEATURE_DIM):
+    v = np.zeros(dim)
+    for b, c in raw_trigram_sparse(line, dim).items():
+        v[b] = c
     return v
 
 
@@ -127,15 +143,52 @@ class _OnlineGaussian:
         self.sum = np.zeros(dim)
         self.sumsq = np.zeros(dim)
         self.freeze_at_n = freeze_at_n
+        # CACHE (2026-10-09, companion fix to raw_trigram_sparse above): mean/var/baseline only
+        # actually change when THIS brick's own (n, sum, sumsq) change (via update() or a merge),
+        # never just because some OTHER brick/line is being evaluated. Before this cache, route()
+        # recomputed mean_var from scratch (a full O(dim) dense op) for EVERY brick on EVERY line
+        # -- confirmed directly to dominate real runtime (round 1 of a 3M-char/1829-line corpus
+        # took 377s; a 4.2M/3799-line round took 1700s, i.e. ~28 minutes). Keying the cache on
+        # self.n is sufficient and safe: n changes IFF sum/sumsq change (every mutation path
+        # increments n alongside them, never independently), so a stale cache is impossible.
+        self._cache_n = -1
+        self._cache_gvar_id = None
+        self._cache_mean = None
+        self._cache_var = None
+        self._cache_baseline = None   # scalar: sum_i[mean_i^2/var_i + log(2*pi*var_i)], the exact
+        # dense term log_density's sparse correction (see below) is computed relative to.
 
     def update(self, x):
+        """x is (idx_array, val_array) [sparse] or a dense ndarray -- see _as_sparse. Sparse
+        update costs O(nnz), not O(dim): self.sum/self.sumsq stay fully dense (required for exact
+        merge-by-addition in BrickCluster.consolidate), but only the touched indices are written."""
         if self.freeze_at_n is not None and self.n >= self.freeze_at_n:
             return
+        idx, val = _as_sparse(x)
         self.n += 1
-        self.sum += x
-        self.sumsq += x * x
+        self.sum[idx] += val
+        self.sumsq[idx] += val * val
+
+    def _cached_stats(self, var_floor_frac, global_var):
+        """Returns (mean, var, baseline), recomputing (all O(dim), done together) only on a real
+        cache miss -- i.e. only for the ONE brick that just changed, not for every brick being
+        compared against it."""
+        if self.n == self._cache_n and id(global_var) == self._cache_gvar_id:
+            return self._cache_mean, self._cache_var, self._cache_baseline
+        mean, var = self._mean_var_uncached(var_floor_frac, global_var)
+        baseline = float(np.sum(mean * mean / var + np.log(2 * np.pi * var)))
+        self._cache_n = self.n
+        self._cache_gvar_id = id(global_var)
+        self._cache_mean, self._cache_var, self._cache_baseline = mean, var, baseline
+        return mean, var, baseline
 
     def mean_var(self, var_floor_frac, global_var):
+        """Kept as a public dense (mean, var) accessor for existing diagnostics -- backed by the
+        same cache as log_density, so calling both doesn't duplicate the O(dim) recompute."""
+        mean, var, _ = self._cached_stats(var_floor_frac, global_var)
+        return mean, var
+
+    def _mean_var_uncached(self, var_floor_frac, global_var):
         if self.n == 0:
             return np.zeros_like(self.sum), np.maximum(global_var * var_floor_frac, 1e-6)
         mean = self.sum / self.n
@@ -173,8 +226,37 @@ class _OnlineGaussian:
         # margin's SCALE independent of FEATURE_DIM (routing's margin>0 test is unaffected either
         # way -- dividing by a positive constant never flips a sign -- only MERGE_SLACK's meaning
         # was at stake). Re-sweep MERGE_SLACK fresh at this scale; do not reuse old values.
-        mean, var = self.mean_var(var_floor_frac, global_var)
-        return -0.5 * np.mean((x - mean) ** 2 / var + np.log(2 * np.pi * var))
+        #
+        # SPARSE CORRECTION (2026-10-09, companion fix): the mean-over-dims sum is additively
+        # separable per dimension, so it splits EXACTLY (not approximately) into a per-brick
+        # BASELINE (sum over ALL dims assuming x=0 everywhere, cached in _cached_stats -- O(dim),
+        # but only recomputed when THIS brick's own stats change) plus a CORRECTION over just x's
+        # nonzero entries (O(nnz)): for i where x_i=0, the term is mean_i^2/var_i + log(2pi var_i),
+        # already folded into baseline; for i where x_i!=0, swap in the true term. Real lines are
+        # sparse (a few hundred to ~1200 nonzero of 8192, _diag_hub_lines.py), so this turns
+        # route()'s dominant O(bricks*lines*dim) cost into O(bricks*lines) cache-hits + O(nnz)
+        # corrections -- confirmed exact, not approximate, via _diag_sparse_exactness.py before
+        # shipping (bit-identical margins to the old dense computation on real data).
+        mean, var, baseline = self._cached_stats(var_floor_frac, global_var)
+        idx, val = _as_sparse(x)
+        if idx.size == 0:
+            correction = 0.0
+        else:
+            m = mean[idx]
+            v = var[idx]
+            correction = float(np.sum((val - m) ** 2 / v - m * m / v))
+        dim = mean.shape[0]
+        return -0.5 / dim * (baseline + correction)
+
+
+def _as_sparse(x):
+    """Normalize a feature vector to (idx_array, val_array) sparse form. x may already be sparse
+    (a 2-tuple) or a dense ndarray (existing diagnostics pass dense arrays -- handled transparently
+    by scanning its nonzeros, same result, just O(dim) to find them instead of O(nnz))."""
+    if isinstance(x, tuple):
+        return x
+    idx = np.nonzero(x)[0]
+    return idx, x[idx]
 
 
 VAR_FLOOR_FRAC = 0.05
@@ -308,35 +390,57 @@ class BrickCluster:
         # commonness of each bucket and should keep refining as more real data is seen, not freeze.
         self.doc_freq = np.zeros(FEATURE_DIM)
         self.n_docs = 0
+        self._gvar_cache = None   # see _global_var -- same cache-by-source-stat-change idea as
+        self._gvar_cache_neg_n = -1   # _OnlineGaussian's, keyed on neg.n (changes IFF neg's own
+        # stats change). Once neg freezes at NEG_FREEZE_AT_N, this returns the SAME array object
+        # every call, which also lets every brick's own _cached_stats (keyed partly on
+        # id(global_var)) hit its cache instead of recomputing per line.
+
+    def tfidf_sparse(self, line):
+        """The real hot-path feature computation -- returns (idx, val), NEVER materializes a
+        dense FEATURE_DIM array (see raw_trigram_sparse's comment for why that matters at
+        FEATURE_DIM=8192). Same TF-IDF math as the now-legacy tfidf_features below, just sparse."""
+        counts = raw_trigram_sparse(line, FEATURE_DIM)
+        if not counts:
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
+        idx = np.fromiter(counts.keys(), dtype=np.int64, count=len(counts))
+        cnt = np.fromiter(counts.values(), dtype=np.float64, count=len(counts))
+        if self.n_docs < IDF_MIN_DOCS:
+            val = cnt
+        else:
+            df = self.doc_freq[idx]
+            idf = np.log((self.n_docs + IDF_SMOOTHING) / (df + IDF_SMOOTHING))
+            val = cnt * idf
+        norm = np.linalg.norm(val)
+        if norm > 0:
+            val = val / norm
+        return idx, val
 
     def tfidf_features(self, line):
-        """The real fix for the collapse found 2026-10-09 (see IDF_MIN_DOCS/IDF_SMOOTHING comment):
-        raw trigram counts over long lines are dominated by universally common English patterns,
-        making almost any two lines look like near-duplicates (measured: 98% of real-corpus line
-        pairs >0.9 cosine similarity under raw counts). Downweight buckets that show up in most
-        lines (idf -> 0, uninformative), upweight buckets specific to few lines (idf large, the
-        actual distinguishing signal). Before IDF_MIN_DOCS documents have been seen, a bucket's
-        document-frequency estimate is too noisy to trust -- fall back to raw counts (unweighted)
-        for that bucket rather than apply a wild, unstable early IDF estimate."""
-        counts = raw_trigram_counts(line, FEATURE_DIM)
-        if self.n_docs < IDF_MIN_DOCS:
-            v = counts
-        else:
-            idf = np.log((self.n_docs + IDF_SMOOTHING) / (self.doc_freq + IDF_SMOOTHING))
-            v = counts * idf
-        norm = np.linalg.norm(v)
-        return v / norm if norm > 0 else v
+        """Dense legacy accessor -- kept ONLY for existing diagnostics that expect a dense array
+        (_diag_merge_mechanics.py etc.); the real pipeline (route/learn_line/forward_logits/
+        generate) uses tfidf_sparse instead, see its docstring for why. Same exact values, just
+        scattered into a dense vector afterward."""
+        idx, val = self.tfidf_sparse(line)
+        v = np.zeros(FEATURE_DIM)
+        v[idx] = val
+        return v
 
     def _update_doc_freq(self, line):
-        counts = raw_trigram_counts(line, FEATURE_DIM)
-        self.doc_freq += (counts > 0).astype(np.float64)
+        counts = raw_trigram_sparse(line, FEATURE_DIM)
+        if counts:
+            idx = np.fromiter(counts.keys(), dtype=np.int64, count=len(counts))
+            self.doc_freq[idx] += 1.0
         self.n_docs += 1
 
     def _global_var(self):
         if self.neg.n < 2:
             return np.ones(FEATURE_DIM)
-        mean = self.neg.sum / self.neg.n
-        return np.maximum(self.neg.sumsq / self.neg.n - mean * mean, 1e-6)
+        if self.neg.n != self._gvar_cache_neg_n:
+            mean = self.neg.sum / self.neg.n
+            self._gvar_cache = np.maximum(self.neg.sumsq / self.neg.n - mean * mean, 1e-6)
+            self._gvar_cache_neg_n = self.neg.n
+        return self._gvar_cache
 
     def _spawn(self):
         idx = len(self.bricks)
@@ -365,7 +469,7 @@ class BrickCluster:
         Takes the raw line TEXT (not pre-computed features, unlike the original version) so TF-IDF
         weighting can use the CURRENT doc-frequency stats before updating them with this line --
         computing features externally would make doc-frequency tracking inconsistent/bypassable."""
-        features = self.tfidf_features(line_text)
+        features = self.tfidf_sparse(line_text)
         idx = self.route(features, for_training=True)
         brick = self.bricks[idx]
         losses = []
@@ -465,14 +569,14 @@ class BrickCluster:
         return total_merged
 
     def forward_logits(self, idxs, line_text):
-        features = self.tfidf_features(line_text)
+        features = self.tfidf_sparse(line_text)
         idx = self.route(features, for_training=False)
         if idx is None:
             return None
         return self.bricks[idx].forward_logits(idxs)
 
     def generate(self, seed_idx, itos, line_text, n=60, temp=0.7, rep_pen=1.0, seed=0):
-        features = self.tfidf_features(line_text)
+        features = self.tfidf_sparse(line_text)
         idx = self.route(features, for_training=False)
         if idx is None:
             return ""
