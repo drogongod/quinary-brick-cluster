@@ -48,7 +48,30 @@ class FixedStepBrick(NativeQuinaryCharLM):
         return new_level
 
 
-FEATURE_DIM = 64
+# 🎯 2026-10-09, ROOT CAUSE #5 -- found by directly instrumenting consolidate()'s ACCEPTED merges
+# (not just the clearly-rejected ones _diag_merge_mechanics.py had been printing) after the
+# MERGE_SLACK re-sweep (0.0-3.0, then 10-5000) showed huge flat dead zones with only two narrow
+# real transitions (10->15, 700->800) -- the real accepted-merge margins were not borderline at
+# all, they were enormous and positive (+168 to +256 log-density units, see
+# _diag_accepted_merges.py), meaning slack can never meaningfully gate them in any sane range.
+# Traced the actual lines behind one such cascade (a single hub brick absorbing 16 different
+# single-line bricks with huge positive margins, _diag_hub_lines.py): completely unrelated
+# content -- "Cato the Younger", "Sylvia Plath's Apotheosis", "SolarWinds supply chain",
+# "I am Galatea, the Philosopher-Queen" declarations -- being treated as near-identical. Measured
+# directly why: real corpus lines average ~3000 trigrams (long paragraphs), hashed into only 64
+# buckets -- ~46 collisions per bucket on AVERAGE, so literally every one of the 64 buckets is
+# nonzero for literally every line regardless of content (confirmed on 5 real lines, 0 exceptions).
+# TF-IDF (IDF_MIN_DOCS/IDF_SMOOTHING, the previous fix) downweights buckets that are common ACROSS
+# lines, but cannot recover signal already destroyed WITHIN a single line by averaging ~46
+# unrelated trigrams into one scalar per bucket before IDF ever sees it -- a strictly earlier,
+# deeper capacity problem than the one TF-IDF fixed. Standard hashing-trick practice (e.g.
+# scikit-learn's HashingVectorizer) uses dims in the thousands-to-millions for exactly this
+# reason. 8192 brings average occupancy for a ~3000-trigram line down to ~0.37/bucket (most
+# buckets 0 or 1 trigram, genuinely sparse) -- O(FEATURE_DIM) per Gaussian update/log_density is
+# still trivial (microseconds) next to a brick's own forward/backward pass. Re-verify the hub-line
+# and full sweep diagnostics after any change to this constant -- do not assume collision rate
+# without measuring it against real line lengths.
+FEATURE_DIM = 8192
 
 
 def det_hash(s):
@@ -60,24 +83,54 @@ def det_hash(s):
     return h
 
 
-def line_features(line, dim=FEATURE_DIM):
+def raw_trigram_counts(line, dim=FEATURE_DIM):
     v = np.zeros(dim)
     s = line.lower()
     for i in range(len(s) - 2):
         v[det_hash(s[i:i + 3]) % dim] += 1
+    return v
+
+
+def line_features(line, dim=FEATURE_DIM):
+    """Plain L2-normalized raw counts, no IDF weighting -- kept for callers with no corpus-wide
+    document-frequency context (standalone tests, one-off scripts). Production use goes through
+    BrickCluster.tfidf_features instead; see its docstring for why raw counts alone are not
+    enough at real scale (confirmed directly: 98% of real-corpus line pairs score >0.9 cosine
+    similarity under raw counts despite being entirely unrelated content -- see
+    brick_cluster_production_port.md)."""
+    v = raw_trigram_counts(line, dim)
     n = np.linalg.norm(v)
     return v / n if n > 0 else v
 
 
 class _OnlineGaussian:
     """Exact incremental diagonal-covariance Gaussian -- count/sum/sum-of-squares per dimension,
-    so mean/var are always exact (not an EMA approximation) and cost O(dim) per update, no refit."""
-    def __init__(self, dim=FEATURE_DIM):
+    so mean/var are always exact (not an EMA approximation) and cost O(dim) per update, no refit.
+
+    freeze_at_n (2026-10-09, real bug found running against the actual 4.2MB corpus): without a
+    cap, a Gaussian fit from EVERY example ever seen keeps widening as more diverse content
+    arrives, which -- for the SHARED background (Phi_neg) specifically -- creates a self-
+    reinforcing runaway: wider Phi_neg inflates the adaptive variance floor on every brick's own
+    Phi_pos (see mean_var below), which makes EVERY acceptance test more lenient, which merges
+    more bricks together, which widens their Phi_pos further, accelerating collapse. Measured
+    directly, same corpus, same MERGE_SLACK, only size varying: 70 bricks at 224 lines -> 49 at
+    532 -> 6 at 819 -> 1 (total collapse) at 1257 and beyond -- a smooth degradation with SCALE,
+    not a threshold effect, confirming the background itself was the thing drifting, not the
+    merge constant. This also means the port had quietly deviated from the actual LSL paper:
+    arXiv:2610.02126's own Phi_neg is explicitly "a SMALL sample from a generic reference
+    dataset... does not require more than 1M tokens" -- a bounded, roughly-stationary reference,
+    not an unboundedly growing one. freeze_at_n=None (the default) keeps the old unbounded
+    behavior, correct for a brick's own Phi_pos (which SHOULD reflect everything it has actually
+    absorbed); BrickCluster's shared `neg` is constructed with a real cap instead."""
+    def __init__(self, dim=FEATURE_DIM, freeze_at_n=None):
         self.n = 0
         self.sum = np.zeros(dim)
         self.sumsq = np.zeros(dim)
+        self.freeze_at_n = freeze_at_n
 
     def update(self, x):
+        if self.freeze_at_n is not None and self.n >= self.freeze_at_n:
+            return
         self.n += 1
         self.sum += x
         self.sumsq += x * x
@@ -97,14 +150,76 @@ class _OnlineGaussian:
         # stalled -- cold-start over-spawning, not a hypothetical concern.
         effective_floor_frac = max(var_floor_frac, 1.0 / max(self.n, 1))
         floor = np.maximum(global_var * effective_floor_frac, 1e-6)
-        return mean, np.maximum(var, floor)
+        # CEILING (2026-10-09, second half of the same runaway bug -- freezing Phi_neg only fixed
+        # one path to it). A brick's own REAL variance (line 108) had a floor but no ceiling: every
+        # merge adds the absorbed brick's sum/sumsq directly in, so a brick that happens to absorb
+        # a few early merges keeps genuinely widening without limit, which makes IT more likely to
+        # accept the next merge and the next routed line (a wide Gaussian assigns real density to
+        # almost anything) -- the identical self-reinforcing runaway as the Phi_neg bug, just
+        # running through a brick's own accumulated stats instead of the shared background. Capping
+        # at a multiple of the now-frozen global_var closes this second path the same way freezing
+        # Phi_neg closed the first -- global_var is now a stable reference to cap against, not a
+        # live-growing one, so this ceiling doesn't drift over time the way an uncapped one would.
+        ceiling = global_var * VAR_CEILING_MULT
+        return mean, np.clip(var, floor, ceiling)
 
     def log_density(self, x, var_floor_frac, global_var):
+        # MEAN over dims, not SUM (2026-10-09, found raising FEATURE_DIM 64->8192 to fix the real
+        # hash-collision bug): a SUM accumulates one term per dimension, so any small systematic
+        # per-dim bias between two Gaussians (e.g. a young brick's inflated 1/n floor vs Phi_neg's
+        # mature one) scales with dim count -- margins that were +-tens/hundreds at dim=64 became
+        # +-thousands at dim=8192 purely from summing 128x more terms, silently invalidating every
+        # previously-swept MERGE_SLACK value with no change in real similarity. Averaging makes the
+        # margin's SCALE independent of FEATURE_DIM (routing's margin>0 test is unaffected either
+        # way -- dividing by a positive constant never flips a sign -- only MERGE_SLACK's meaning
+        # was at stake). Re-sweep MERGE_SLACK fresh at this scale; do not reuse old values.
         mean, var = self.mean_var(var_floor_frac, global_var)
-        return -0.5 * np.sum((x - mean) ** 2 / var + np.log(2 * np.pi * var))
+        return -0.5 * np.mean((x - mean) ** 2 / var + np.log(2 * np.pi * var))
 
 
 VAR_FLOOR_FRAC = 0.05
+
+# 🛑 2026-10-09, real bug found running the actual 4.2MB production corpus (not a smaller test
+# slice): the shared Phi_neg was growing from EVERY line ever seen, unboundedly. Measured
+# directly, same corpus, same MERGE_SLACK=3.0, only size varying: 70 bricks at 224 lines -> 49 at
+# 532 -> 6 at 819 -> 1 (total collapse) at 1257+ lines -- a smooth degradation with scale, not a
+# threshold effect tied to the merge constant. Root cause: a wider Phi_neg inflates the adaptive
+# variance floor on every brick's Phi_pos (see _OnlineGaussian.mean_var), which makes EVERY
+# acceptance test more lenient as more total data flows through, a self-reinforcing runaway no
+# fixed MERGE_SLACK value can fully prevent. This was a real deviation from the actual LSL paper
+# (arXiv:2610.02126), whose own Phi_neg is explicitly "a SMALL sample... does not require more
+# than 1M tokens" -- bounded on purpose, not grown forever. NEG_FREEZE_AT_N caps the shared
+# background at a sample size already confirmed healthy (224 lines produced 70 well-formed
+# bricks with good quality) with real margin above it.
+NEG_FREEZE_AT_N = 300
+
+# 🛑 2026-10-09, SECOND half of the same runaway bug, found by re-examining the mechanism after
+# Jonathan flagged "signs of an underlying problem unfixed" even after NEG_FREEZE_AT_N -- he was
+# right. Freezing Phi_neg closed ONE path to runaway acceptance (the shared background growing
+# unboundedly); a brick's OWN variance had a floor (above) but no ceiling, so a brick that happens
+# to absorb a few early merges keeps genuinely widening without limit as more merged content's
+# sum/sumsq gets added in -- the identical self-reinforcing dynamic, running through a single
+# brick's real stats instead of the shared background. VAR_CEILING_MULT caps any Gaussian's
+# variance at this multiple of the (now-frozen, stable) global_var -- see _OnlineGaussian.mean_var.
+VAR_CEILING_MULT = 4.0
+
+# 🎯 2026-10-09, THE REAL ROOT CAUSE, found by directly instrumenting a merge pass on the actual
+# 1.5M-char corpus after NEITHER the Phi_neg freeze NOR the variance ceiling changed the outcome
+# at all. Measured directly: mean pairwise cosine similarity among 50 real, completely unrelated
+# lines (WannaCry / Bangladesh Bank / DarkWeb market / Equifax / Target breach -- different
+# incidents, different content) was 0.965, with 98% of all pairs scoring above 0.9. Raw bag-of-
+# trigram-hash COUNTS over long (~3000-char) English prose is dominated by universally common
+# patterns ("the", "ing", spaces, punctuation) that look nearly identical across any sufficiently
+# long passage, regardless of topic -- topic-specific signal gets drowned out by sheer volume of
+# generic trigrams. This was never a gate-logic bug: the gate was behaving correctly on features
+# that had already lost almost all distinguishing signal before the gate ever saw them. Neither
+# candidate-limiting, variance-capping, nor background-freezing could fix a problem one layer
+# below the gate. Real, standard fix: TF-IDF -- downweight trigrams that appear in most lines
+# (uninformative), upweight the ones specific to few (actually distinguishing). IDF_MIN_DOCS
+# gates when a trigram bucket's IDF weight is trusted (too few documents seen = too noisy an
+# estimate of how "common" it really is); IDF_SMOOTHING is the standard +1 Laplace term.
+IDF_MIN_DOCS = 20
+IDF_SMOOTHING = 1.0
 
 # 🔧 2026-10-09, Jonathan: "tighten merging for efficiency" -- measured result (30-pass, 500KB
 # corpus): growth+consolidate SETTLES cleanly (105-106 bricks, stable from round 5 through round 30,
@@ -137,10 +252,40 @@ VAR_FLOOR_FRAC = 0.05
 # safety/quality tradeoff, the safe choice also happens to be the best one measured. Honest cost:
 # 722K params, still above the 627K target -- crossing that line appears to require the unstable
 # zone, which this data shows risks catastrophic collapse, not a graceful tradeoff. Not chasing it.
-MERGE_SLACK = 3.0   # log-density units; margin > -MERGE_SLACK accepted. See sweep above for the
-# full curve before changing this -- re-verify against a real sweep, not a guess, if ever revisited.
+#
+# ⛔ SUPERSEDED, 2026-10-09 -- the above sweep was calibrated against FEATURE_DIM=64 with a SUMMED
+# log_density. Real-mind collapse (1 brick from 59.7M chars) forced a 5-bug diagnostic arc
+# (brick_cluster_production_port.md memory has the full chain): Phi_neg freeze + variance ceiling
+# + candidate-K limiting (first three fixes, each real but each confirmed via direct
+# instrumentation to NOT be the dominant mechanism) -> TF-IDF (fixed scale-dependent collapse but
+# overcorrected diversity) -> THE REAL ROOT CAUSE: FEATURE_DIM=64 so undersized that real ~3000-
+# trigram lines averaged ~46 hash collisions PER BUCKET, saturating all 64 buckets for every line
+# regardless of content (confirmed: unrelated paragraphs on Cato the Younger, Sylvia Plath,
+# SolarWinds, and Galatea-identity declarations all cascaded into one hub with +168 to +256
+# log-density margins -- nowhere near borderline, so no slack value could have fixed it).
+# FEATURE_DIM raised 64->8192 (see its own module comment) fixed the collision saturation but, as
+# a direct side effect, broke THIS constant's calibration a second time -- log_density SUMMED
+# over dims, so summing 128x more terms amplified any small systematic bias 128x, making
+# slack=3.0 accept nearly everything (171 bricks collapsed toward 1 again). Fixed log_density to
+# use np.mean instead of np.sum (see its own comment) -- margin scale is now independent of
+# FEATURE_DIM. Re-swept MERGE_SLACK FRESH at this new scale (0.0-2.0 coarse, 0.12-0.28 fine,
+# 30-pass stability check at 0.18/0.22/0.25): a smooth CONTINUOUS curve this time, not a sharp
+# cliff -- 0.0->171, 0.1->153, 0.15->121, 0.18->99, 0.22->71, 0.25->55, 0.28->32, 0.5->8,
+# 0.75->2, 1.0->1 (collapse). All of 0.18/0.22/0.25 held STABLE across the full 30 passes (zero
+# churn after initial settling -- the real safety property, not just a snapshot). slack=0.22
+# chosen: 71 bricks / 732,720 params lands almost exactly on the PRE-BUG healthy target (70
+# bricks / 722,400 params) -- strong independent confirmation that the representation, not the
+# threshold, was always the real lever.
+MERGE_SLACK = 0.22   # mean-log-density units (see log_density's np.mean normalization); margin >
+# -MERGE_SLACK accepted. This value is NOT comparable to the old sum-based sweep above -- re-
+# verify against a real sweep, not a guess, if FEATURE_DIM or the log_density aggregation ever
+# changes again (both silently rescale what this constant means, confirmed twice this session).
 MERGE_MAX_ROUNDS = 10   # safety cap on the fixed-point iteration -- merges strictly reduce brick
 # count each round so termination is guaranteed regardless, this just bounds worst-case cost.
+
+MERGE_CANDIDATE_K = 10   # bound the number of bigger-brick candidates tested per merge decision --
+# see the real multiple-comparisons bug this fixes in consolidate()'s own comment. Same role as
+# WOLFPACK_GATE_K_NEIGHBORS in sovereign_core.py's own LSL-gate port.
 
 
 class BrickCluster:
@@ -152,8 +297,40 @@ class BrickCluster:
         self.D_brick = D_brick
         self.seed = seed
         self.bricks = []
-        self.brick_pos = []       # one _OnlineGaussian per brick (Phi_pos)
-        self.neg = _OnlineGaussian()   # shared Phi_neg, every line ever seen
+        self.brick_pos = []       # one _OnlineGaussian per brick (Phi_pos) -- unbounded on purpose,
+                                   # should reflect everything that brick has actually absorbed.
+        self.neg = _OnlineGaussian(freeze_at_n=NEG_FREEZE_AT_N)   # shared Phi_neg, BOUNDED --
+                                   # see _OnlineGaussian's freeze_at_n docstring for why.
+        # TF-IDF document-frequency tracking (the real root-cause fix, see IDF_MIN_DOCS/
+        # IDF_SMOOTHING's module comment) -- doc_freq[k] = how many LINES contained trigram-hash
+        # bucket k at all (presence, not raw count); n_docs = total lines seen. Unbounded on
+        # purpose, unlike Phi_neg -- IDF weights are meant to reflect the TRUE corpus-wide
+        # commonness of each bucket and should keep refining as more real data is seen, not freeze.
+        self.doc_freq = np.zeros(FEATURE_DIM)
+        self.n_docs = 0
+
+    def tfidf_features(self, line):
+        """The real fix for the collapse found 2026-10-09 (see IDF_MIN_DOCS/IDF_SMOOTHING comment):
+        raw trigram counts over long lines are dominated by universally common English patterns,
+        making almost any two lines look like near-duplicates (measured: 98% of real-corpus line
+        pairs >0.9 cosine similarity under raw counts). Downweight buckets that show up in most
+        lines (idf -> 0, uninformative), upweight buckets specific to few lines (idf large, the
+        actual distinguishing signal). Before IDF_MIN_DOCS documents have been seen, a bucket's
+        document-frequency estimate is too noisy to trust -- fall back to raw counts (unweighted)
+        for that bucket rather than apply a wild, unstable early IDF estimate."""
+        counts = raw_trigram_counts(line, FEATURE_DIM)
+        if self.n_docs < IDF_MIN_DOCS:
+            v = counts
+        else:
+            idf = np.log((self.n_docs + IDF_SMOOTHING) / (self.doc_freq + IDF_SMOOTHING))
+            v = counts * idf
+        norm = np.linalg.norm(v)
+        return v / norm if norm > 0 else v
+
+    def _update_doc_freq(self, line):
+        counts = raw_trigram_counts(line, FEATURE_DIM)
+        self.doc_freq += (counts > 0).astype(np.float64)
+        self.n_docs += 1
 
     def _global_var(self):
         if self.neg.n < 2:
@@ -182,9 +359,13 @@ class BrickCluster:
             return self._spawn()
         return best_idx
 
-    def learn_line(self, batches_for_line, features, lr_scale):
+    def learn_line(self, batches_for_line, line_text, lr_scale):
         """batches_for_line: the windowed batches (same bucket-by-length convention as
-        lutgtlm_ingest.py) for ONE line. Routes (possibly spawning), trains, updates the gate."""
+        lutgtlm_ingest.py) for ONE line. Routes (possibly spawning), trains, updates the gate.
+        Takes the raw line TEXT (not pre-computed features, unlike the original version) so TF-IDF
+        weighting can use the CURRENT doc-frequency stats before updating them with this line --
+        computing features externally would make doc-frequency tracking inconsistent/bypassable."""
+        features = self.tfidf_features(line_text)
         idx = self.route(features, for_training=True)
         brick = self.bricks[idx]
         losses = []
@@ -192,6 +373,7 @@ class BrickCluster:
             losses.append(float(brick.learn_batch(b, lr_scale=lr_scale).mean()))
         self.brick_pos[idx].update(features)
         self.neg.update(features)
+        self._update_doc_freq(line_text)
         return idx, (sum(losses) / len(losses) if losses else None)
 
     def consolidate(self):
@@ -248,9 +430,23 @@ class BrickCluster:
                 if small_pos.n == 0:
                     continue
                 small_mean = small_pos.sum / small_pos.n
-                for big_i in order[:rank]:   # only consider STRICTLY bigger/equal-or-earlier bricks
-                    if big_i in absorbed_into or big_i == small_i:
-                        continue
+                # MERGE_CANDIDATE_K (2026-10-09, real bug found by directly instrumenting a merge
+                # pass on the actual 1.5M-char corpus, not guessed): candidates used to be EVERY
+                # bigger-or-equal-ranked brick -- order[:rank], which is up to hundreds at real
+                # scale (444 bricks measured). Confirmed directly: individual pairwise margins were
+                # correctly large and negative (-20 to -47 against the single biggest brick, well
+                # below -MERGE_SLACK=-3, correctly rejected) -- the per-pair logic was never wrong.
+                # But testing hundreds of independent candidates per decision makes it near-certain
+                # SOME candidate clears the bar by chance, a real multiple-comparisons problem, not
+                # a variance or background-scale problem (which is exactly why capping variance via
+                # VAR_CEILING_MULT changed nothing -- that fix addressed a mechanism that was never
+                # the active one). Bounding candidates to the K nearest by distance, same spirit as
+                # Sovereign Core's own WOLFPACK_GATE_K_NEIGHBORS, caps the number of trials per
+                # decision regardless of total population size.
+                candidates = [big_i for big_i in order[:rank] if big_i not in absorbed_into and big_i != small_i]
+                candidates.sort(key=lambda big_i: float(np.sum(
+                    (small_mean - self.brick_pos[big_i].sum / max(self.brick_pos[big_i].n, 1)) ** 2)))
+                for big_i in candidates[:MERGE_CANDIDATE_K]:
                     big_pos = self.brick_pos[big_i]
                     margin = big_pos.log_density(small_mean, VAR_FLOOR_FRAC, gvar) - neg_ld(small_i, small_mean)
                     if margin > -MERGE_SLACK:
@@ -268,13 +464,15 @@ class BrickCluster:
             total_merged += len(absorbed_into)
         return total_merged
 
-    def forward_logits(self, idxs, features):
+    def forward_logits(self, idxs, line_text):
+        features = self.tfidf_features(line_text)
         idx = self.route(features, for_training=False)
         if idx is None:
             return None
         return self.bricks[idx].forward_logits(idxs)
 
-    def generate(self, seed_idx, itos, features, n=60, temp=0.7, rep_pen=1.0, seed=0):
+    def generate(self, seed_idx, itos, line_text, n=60, temp=0.7, rep_pen=1.0, seed=0):
+        features = self.tfidf_features(line_text)
         idx = self.route(features, for_training=False)
         if idx is None:
             return ""
@@ -283,7 +481,8 @@ class BrickCluster:
     def export_state(self):
         state = {"n_bricks": np.array(len(self.bricks)), "V": np.array(self.V),
                  "D_brick": np.array(self.D_brick), "seed": np.array(self.seed),
-                 "neg_n": np.array(self.neg.n), "neg_sum": self.neg.sum, "neg_sumsq": self.neg.sumsq}
+                 "neg_n": np.array(self.neg.n), "neg_sum": self.neg.sum, "neg_sumsq": self.neg.sumsq,
+                 "doc_freq": self.doc_freq, "n_docs": np.array(self.n_docs)}
         for i, (brick, pos) in enumerate(zip(self.bricks, self.brick_pos)):
             bstate = brick.export_state()
             for k, v in bstate.items():
@@ -301,6 +500,8 @@ class BrickCluster:
         cluster.neg.n = int(state["neg_n"])
         cluster.neg.sum = state["neg_sum"]
         cluster.neg.sumsq = state["neg_sumsq"]
+        cluster.doc_freq = state["doc_freq"]
+        cluster.n_docs = int(state["n_docs"])
         for i in range(n_bricks):
             brick = FixedStepBrick.__new__(FixedStepBrick)
             brick.V = V; brick.D = D_brick

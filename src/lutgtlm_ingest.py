@@ -29,7 +29,7 @@ always held itself to.
 """
 import json, os, shutil, time, sys, argparse, numpy as np
 from collections import defaultdict
-from brick_cluster_charlm import BrickCluster, line_features
+from brick_cluster_charlm import BrickCluster
 
 ARCH = "brick_cluster_quinary_v1"
 BATCH_SIZE = 128
@@ -85,7 +85,7 @@ def mean_ce(cluster, sample):
         ids = enc(ln)[:121]
         if len(ids) < 3:
             continue
-        logits = cluster.forward_logits(ids, line_features(ln))
+        logits = cluster.forward_logits(ids, ln)
         if logits is None:
             continue
         for t in range(len(ids) - 1):
@@ -158,8 +158,7 @@ def ingest(cluster, text, passes, seen, on_round=None, held_out_seed=0):
             batches = _line_batches(ln)
             if not batches:
                 continue
-            feats = line_features(ln)
-            idx, line_loss = cluster.learn_line(batches, feats, lr_scale=LR_SCALE)
+            idx, line_loss = cluster.learn_line(batches, ln, lr_scale=LR_SCALE)
             n_windows = sum(len(b) for b in batches)
             if line_loss is not None:
                 tot += line_loss * n_windows
@@ -191,7 +190,7 @@ def main():
           f"bricks, arch={ARCH}" if seen else f"[mind] fresh mind, arch={ARCH}")
 
     if a.say is not None:
-        out = cluster.generate(enc(a.say), ITOS, line_features(a.say), n=60)
+        out = cluster.generate(enc(a.say), ITOS, a.say, n=60)
         print(f"  say {a.say!r:14s} -> {out!r}")
         return
     if not a.source:
@@ -215,7 +214,7 @@ def main():
     ingests = ingests_so_far[0]
     save(cluster, seen, ingests)
     print(f"[mind] learned. now {seen} chars over {ingests} ingestions, {len(cluster.bricks)} bricks -> saved {STATE}")
-    print(f"  sample  'i am' -> {cluster.generate(enc('i am'), ITOS, line_features('i am'), n=60)!r}")
+    print(f"  sample  'i am' -> {cluster.generate(enc('i am'), ITOS, 'i am', n=60)!r}")
 
 if __name__ == "__main__":
     main()
